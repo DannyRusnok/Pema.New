@@ -174,25 +174,26 @@ namespace ExcelProcessor
                     var nakupniCenaCell = worksheet.Cells[row, 7]; // Sloupec G
                     var ruleCell = worksheet.Cells[row, 10];   // Sloupec J
 
-                    // Kontrola, zda řádek obsahuje data
-                    if (kodCell.Value == null && eanCell.Value == null)
+                    // Získání hodnot EAN a Rule
+                    string ean = eanCell.Value?.ToString()?.Trim() ?? string.Empty;
+                    string rule = ruleCell.Value?.ToString()?.Trim() ?? string.Empty;
+
+                    // Ignorovat řádky, kde není EAN nebo Rule
+                    if (string.IsNullOrWhiteSpace(ean) || string.IsNullOrWhiteSpace(rule))
                         continue;
 
                     var record = new SkladRecord
                     {
                         Kod = kodCell.Value?.ToString() ?? string.Empty,
-                        EAN = eanCell.Value?.ToString() ?? string.Empty,
+                        EAN = ean,
                         Nazev = nazevCell.Value?.ToString() ?? string.Empty,
                         Sklad = GetNumericValue(skladCell.Value),
                         NakupniCena = GetNumericValue(nakupniCenaCell.Value),
-                        Rule = ruleCell.Value?.ToString()?.Trim() ?? string.Empty,
+                        Rule = rule,
                         RowNumber = row
                     };
 
-                    if (!string.IsNullOrWhiteSpace(record.Kod) || !string.IsNullOrWhiteSpace(record.EAN))
-                    {
-                        data.Add(record);
-                    }
+                    data.Add(record);
                 }
             }
 
@@ -221,40 +222,40 @@ namespace ExcelProcessor
         }
 
         // Zpracování dat podle pravidel
+        // Výsledný soubor bude mít tolik řádků, kolik existuje shod v obou vstupních souborech
+        // Pořadí řádků v výsledném souboru odpovídá pořadí v sklad.xlsx
+        // Párování EAN: EAN z Heureka musí začínat EANem ze Skladu (startsWith)
         static List<ResultRecord> ProcessData(List<HeurekaRecord> heurekaData, List<SkladRecord> skladData)
         {
             var results = new List<ResultRecord>();
 
-            // Vytvoření slovníku pro rychlé vyhledávání podle EAN
-            var heurekaByEAN = new Dictionary<string, HeurekaRecord>();
-            foreach (var heureka in heurekaData)
-            {
-                if (!string.IsNullOrWhiteSpace(heureka.EAN))
-                {
-                    string eanKey = heureka.EAN.Trim();
-                    // Pokud už existuje záznam se stejným EAN, použijeme první nalezený
-                    if (!heurekaByEAN.ContainsKey(eanKey))
-                    {
-                        heurekaByEAN[eanKey] = heureka;
-                    }
-                }
-            }
-
             int matchedCount = 0;
             int unmatchedCount = 0;
 
+            // Procházíme skladData v pořadí, jak jsou načteny ze souboru (zachováváme pořadí z sklad.xlsx)
             foreach (var sklad in skladData)
             {
                 // Najít odpovídající záznam z Heureka podle EAN
+                // EAN z Heureka musí začínat EANem ze Skladu (startsWith)
                 HeurekaRecord? heureka = null;
                 
                 if (!string.IsNullOrWhiteSpace(sklad.EAN))
                 {
-                    string eanKey = sklad.EAN.Trim();
-                    if (heurekaByEAN.TryGetValue(eanKey, out var foundHeureka))
+                    string skladEAN = sklad.EAN.Trim();
+                    
+                    // Procházíme všechny záznamy z Heureka a hledáme první, kde EAN začíná EANem ze Skladu
+                    foreach (var h in heurekaData)
                     {
-                        heureka = foundHeureka;
-                        matchedCount++;
+                        if (!string.IsNullOrWhiteSpace(h.EAN))
+                        {
+                            string heurekaEAN = h.EAN.Trim();
+                            if (heurekaEAN.StartsWith(skladEAN, StringComparison.OrdinalIgnoreCase))
+                            {
+                                heureka = h;
+                                matchedCount++;
+                                break; // Použijeme první nalezený záznam
+                            }
+                        }
                     }
                 }
 
@@ -266,17 +267,44 @@ namespace ExcelProcessor
                     continue;
                 }
 
+                if (string.IsNullOrWhiteSpace(sklad.Rule))
+                {
+                    Console.WriteLine($"  Varování: Chybí Rule pro EAN: {sklad.EAN} (Kód: {sklad.Kod})");
+                    continue;
+                }
+
                 // Výpočet DPH podle názvu produktu
                 double dph = CalculateDPH(sklad.Nazev);
 
-                // Výpočet prodejní ceny bez DPH z původní ceny s DPH
-                double prodejniCenaBezDPH = heureka.ProdejniCena / (1 + dph / 100);
-
-                // Výpočet rabatu podle pravidla
-                double rabat = CalculateRabat(sklad.Rule, prodejniCenaBezDPH, sklad.NakupniCena, sklad.Sklad);
+                // Výpočet nové prodejní ceny bez DPH z nákupní ceny a pravidla
+                double novaProdejniCenaBezDPH;
+                double rabat;
+                
+                string rule = sklad.Rule.Trim().ToLower();
+                
+                // Pro všechna pravidla vypočítáme rabat a pak z něj novou cenu
+                rabat = CalculateRabat(sklad.Rule, sklad.NakupniCena, sklad.Sklad);
+                
+                // Výpočet nové prodejní ceny bez DPH z nákupní ceny a rabatu
+                // Vzorec: prodejní = nákupní / (1 - rabat/100)
+                // Tento vzorec vychází z: rabat = (prodejní - nákupní) / prodejní * 100
+                if (rabat == 0)
+                {
+                    // Pokud je rabat 0%, cena = nákupní cena
+                    novaProdejniCenaBezDPH = sklad.NakupniCena;
+                }
+                else if (rabat >= 100 || rabat < 0)
+                {
+                    // Pokud je rabat >= 100% nebo záporný, použijeme nákupní cenu
+                    novaProdejniCenaBezDPH = sklad.NakupniCena;
+                    rabat = 0;
+                }
+                else
+                {
+                    novaProdejniCenaBezDPH = sklad.NakupniCena / (1 - rabat / 100);
+                }
 
                 // Výpočet nové prodejní ceny s DPH
-                double novaProdejniCenaBezDPH = prodejniCenaBezDPH * (1 - rabat / 100);
                 double novaProdejniCenaSDPH = novaProdejniCenaBezDPH * (1 + dph / 100);
 
                 // Výpočet pozice na heurece podle sloupců P-AH
@@ -294,6 +322,7 @@ namespace ExcelProcessor
                     NovaProdejniCenaSDPH = Math.Round(novaProdejniCenaSDPH, 2),
                     NovaProdejniCenaBezDPH = Math.Round(novaProdejniCenaBezDPH, 2),
                     Rabat = Math.Round(rabat, 2),
+                    Rule = sklad.Rule,
                     PoziceNaHeurece = poziceNaHeurece,
                     OdkazNaHeureku = heureka.HeurekaOdkaz
                 };
@@ -377,19 +406,10 @@ namespace ExcelProcessor
         }
 
         // Výpočet rabatu podle pravidla
+        // Rabat se počítá pouze z nákupní ceny a pravidla, bez staré prodejní ceny
         // Výpočet Rabatu: (prodejní - nákupní) / prodejní (bez DPH) %
-        static double CalculateRabat(string rule, double prodejniCenaBezDPH, double nakupniCena, double sklad)
+        static double CalculateRabat(string rule, double nakupniCena, double sklad)
         {
-            if (string.IsNullOrWhiteSpace(rule))
-            {
-                // Výchozí výpočet: (prodejní - nákupní) / prodejní (bez DPH) %
-                if (prodejniCenaBezDPH > 0)
-                {
-                    return ((prodejniCenaBezDPH - nakupniCena) / prodejniCenaBezDPH) * 100;
-                }
-                return 0;
-            }
-
             rule = rule.Trim().ToLower();
 
             switch (rule)
@@ -404,17 +424,9 @@ namespace ExcelProcessor
                     // Rabat minimálně 10%, kde je více než 3 kusů tak klidně rabat 0 a nejnižší cenu
                     if (sklad > 3)
                     {
-                        // Nejnižší možná cena = nákupní cena + minimální marže (např. 1%)
-                        double minCena = nakupniCena * 1.01;
-                        if (minCena < prodejniCenaBezDPH)
-                        {
-                            // Vypočítat rabat potřebný pro dosažení minimální ceny
-                            double calculatedRabat = ((prodejniCenaBezDPH - minCena) / prodejniCenaBezDPH) * 100;
-                            return Math.Max(0, calculatedRabat); // Minimálně 0%
-                        }
-                        // Pokud minimální cena je vyšší než prodejní, použijeme 0% rabat
                         return 0;
                     }
+
                     // Pokud je sklad <= 3, minimálně 10% rabat
                     return 10;
 
@@ -425,24 +437,13 @@ namespace ExcelProcessor
 
                 case "rule 4":
                 case "4":
-                    // Cena nákupky + pět procent
-                    // Cílová cena = nákupní cena * 1.05
-                    double cilovaCena = nakupniCena * 1.05;
-                    if (cilovaCena < prodejniCenaBezDPH && prodejniCenaBezDPH > 0)
-                    {
-                        // Vypočítat rabat potřebný pro dosažení cílové ceny
-                        return ((prodejniCenaBezDPH - cilovaCena) / prodejniCenaBezDPH) * 100;
-                    }
-                    // Pokud cílová cena je vyšší než prodejní, použijeme 0% rabat
-                    return 0;
+                    // Rule 4: Rabat 5% vždy
+                    return 5;
 
                 default:
-                    // Výchozí výpočet: (prodejní - nákupní) / prodejní (bez DPH) %
-                    if (prodejniCenaBezDPH > 0)
-                    {
-                        return ((prodejniCenaBezDPH - nakupniCena) / prodejniCenaBezDPH) * 100;
-                    }
-                    return 0;
+                    // Výchozí: minimální marže 1% (rabat bude záporný, což znamená marže)
+                    // Pro výchozí případ použijeme minimální marži
+                    return -1; // Záporný rabat znamená marži
             }
         }
 
@@ -464,7 +465,7 @@ namespace ExcelProcessor
                 string[] headers = {
                     "Kód", "Název", "EAN", "Sklad", "Nákupka", 
                     "Nová prodejní cena s DPH", "Nová prodejní cena bez DPH", 
-                    "Rabat", "Pozice na heurece", "Odkaz na heureku"
+                    "Rabat", "Rule", "Pozice na heurece", "Odkaz na heureku"
                 };
 
                 for (int col = 0; col < headers.Length; col++)
@@ -487,6 +488,7 @@ namespace ExcelProcessor
                     worksheet.Cells[row + 2, col++].Value = record.NovaProdejniCenaSDPH;
                     worksheet.Cells[row + 2, col++].Value = record.NovaProdejniCenaBezDPH;
                     worksheet.Cells[row + 2, col++].Value = record.Rabat;
+                    worksheet.Cells[row + 2, col++].Value = record.Rule;
                     worksheet.Cells[row + 2, col++].Value = record.PoziceNaHeurece;
                     worksheet.Cells[row + 2, col++].Value = record.OdkazNaHeureku;
                 }
@@ -532,6 +534,7 @@ namespace ExcelProcessor
         public double NovaProdejniCenaSDPH { get; set; }
         public double NovaProdejniCenaBezDPH { get; set; }
         public double Rabat { get; set; }
+        public string Rule { get; set; } = string.Empty;
         public int PoziceNaHeurece { get; set; }
         public string OdkazNaHeureku { get; set; } = string.Empty;
     }
